@@ -6,6 +6,7 @@ import time
 
 from states import Form, Food_states
 from api import get_food_calories
+from api import get_weather_async
 
 router = Router()
 #Временное хранилище данных
@@ -26,7 +27,7 @@ users = {
         "current_levels": {
            "water_level": 0,
            "kkal_level": 0,
-           "activity_level": 0,
+           "activity_loss": 0,
         }
     }
 }
@@ -39,6 +40,7 @@ keyboard = InlineKeyboardMarkup( # Создаем объект клавиату�
         [InlineKeyboardButton(text="✏️ Учет еды", callback_data="btn3")],
         [InlineKeyboardButton(text="✏️ Учет тренировок", callback_data="btn4")],
         [InlineKeyboardButton(text="📊 Мой прогресс", callback_data="btn5")],
+        [InlineKeyboardButton(text="❌ Очистить записи", callback_data="btn6")],
     ]
 )
 
@@ -110,12 +112,13 @@ async def process_age(message: Message, state: FSMContext):
           water_target = round(30 * weight + (activity_level / 30) * 500)
           users['user_id']['calorie_goal'] = kkal_target
           users['user_id']['water_goal'] = water_target
-       await message.reply(f"""Твой профиль:
-       {name} Бальбоа;
-    Возраст: {age};
-    Вес: {weight};
-    Рост: {height};
-    Уровень активности: {activity_level};
+       await message.reply(f"""
+    Твой профиль:
+    {name} Бальбоа;
+    Возраст: {age} лет;
+    Вес: {weight} кг;
+    Рост: {height} см;
+    Уровень активности: {activity_level} минут в день;
     🌇 Город: {city};
     🎯 Норма калорий: {kkal_target} ккал; 
     💧 Базовая норма воды: {water_target} мл.
@@ -156,6 +159,10 @@ async def handle_callback(callback_query, state: FSMContext):
         #Статистика
         await callback_query.answer() 
         await cmd_check_progress(callback_query.message)
+    elif callback_query.data == "btn6":
+        #Статистика
+        await callback_query.answer() 
+        await delete_logs(callback_query.message)
         
 
 @router.message(Command("log_water"))
@@ -197,7 +204,7 @@ async def cmd_log_food(message: Message, state: FSMContext):
         await message.reply("Как тебя зовут ❓")
         await state.set_state(Form.name)
     else:    
-       await message.answer("Учтем калорийность приемов пиши: введи название продукта (по-английски, если не знаешь калоррийность) ❓")
+       await message.answer("Учтем калорийность приемов пиши: введи название продукта ❓")
        await state.set_state(Food_states.food_name)
 
 @router.message(Food_states.food_name)
@@ -255,11 +262,13 @@ async def cmd_log_workout(message: Message, state: FSMContext):
         await message.reply("Как тебя зовут ❓")
         await state.set_state(Form.name)
     else:   
-        await message.answer("""Напиши через пробел в одну строку тип тренировки цифрой из списка: 
-                             1. Интенсивное кардио, 
-                             2. Спортзал, 
-                             3. Прогулка.
-                             И время тренировки в минутах❓""")
+        await message.answer(
+        """Напиши через пробел в одну строку тип тренировки цифрой из списка: 
+            1. Интенсивное кардио, 
+            2. Спортзал, 
+            3. Прогулка.
+           И время тренировки в минутах. 
+           Пример: 30 минут бега - это "1 30" ❓""")
         await state.set_state(Form.activity_log)
 
 @router.message(Form.activity_log)
@@ -275,10 +284,32 @@ async def calculate_workout(message: Message, state: FSMContext):
         try:
            water_loss = int(activity_types[my_message[0]]["water_per30"]*(int(my_message[1])/30))
            kkal_loss = int(activity_types[my_message[0]]["kkal_per30"]*(int(my_message[1])/30))
+           
+           weather_kkal = 0 # корректировка расхода калорий от погоды
+           weather_water = 0 # корректировка расхода воды от погоды
+           try:
+               await message.answer("🔎 Ищу информацию о погоде в вашем городе...")
+               weather_info = dict(await get_weather_async(users["user_id"]["city"]))
+               temp = float(weather_info["temp"])
+               feels_like = float(weather_info["feels_like"])
+               if feels_like < -20: 
+                   await message.answer(f"На улице дубак: {temp} градусов. Ощущается, как {feels_like} 🥶 Ты расходуешь больше калорий. Занимайся в помещении.")
+                   weather_kkal = 100 # увеличиваю расход калорий (на холоде нужно больше)
+               elif -20 < feels_like < 0: await message.answer(f"На улице прохладно: {temp} градусов. Ощущается, как {feels_like} 🙂 При желании можно заниматься.")
+               elif 0 < feels_like < 20: await message.answer(f"На улице комфортно: {temp} градусов. Ощущается, как {feels_like} 🙂 Иди заниматься!")
+               elif 20 < feels_like < 30: 
+                   await message.answer(f"На улице жара: {temp} градусов. Ощущается, как {feels_like} 🥵 Ты расходуешь больше калорий и много воды, не забывай восполнять жидкость.")                
+                   weather_kkal = 100 # увеличиваю расход калорий (на жаре расход больше)
+                   weather_water = 100
+           except Exception as e:
+               await message.answer("Погоду не нашел, видимо, указан неизвестный город, посчитаю все без нее.")
+               print(e)
+           water_loss = water_loss + weather_water * int(my_message[1])/30
+           kkal_loss = kkal_loss + weather_kkal * int(my_message[1])/30
            users["user_id"]["current_levels"]["water_level"] -= water_loss
            users["user_id"]["current_levels"]["kkal_level"] -= kkal_loss
+           users["user_id"]["current_levels"]["activity_loss"] += kkal_loss
            await message.answer(f"Отлично, ты сжег {kkal_loss} калорий и сегодня можешь позволить себе больше, но восполни {water_loss} мл воды 🏃🏻‍♂️")
-        
         except Exception as e:
             print(e)
             await message.reply("Ошибка ввода!")
@@ -291,28 +322,40 @@ async def calculate_workout(message: Message, state: FSMContext):
 @router.message(Command("check_progress"))
 async def cmd_check_progress(message: Message):
     await message.answer(f"""
-        {users['user_id']['name']} Бальбоа:
+        {
+    users['user_id']['name']} Бальбоа:
         
-    Возраст: {users['user_id']['age']};
-    Вес: {users['user_id']['weight']};
-    Рост: {users['user_id']['height']};
-    Уровень активности: {users['user_id']['activity']};
+    Возраст: {users['user_id']['age']} лет;
+    Вес: {users['user_id']['weight']} кг;
+    Рост: {users['user_id']['height']} см;
+    Уровень активности: {users['user_id']['activity']} минут в день;
     🌇 Город: {users['user_id']['city']};
     🎯 Норма калорий: {users['user_id']['calorie_goal']} ккал, 
     💧 Базовая норма воды: {users['user_id']['water_goal']} мл""")
-    
     current_kkal = users['user_id']['current_levels']['kkal_level']
     delta_kkal = users['user_id']['calorie_goal'] - current_kkal
     current_water = users['user_id']['current_levels']['water_level']
     delta_water = users['user_id']['water_goal'] - current_water
-    if delta_kkal > 0: await message.answer(f"За сегодня ты уже съел {max(current_kkal, 0)} калорий, осталось до цели {delta_kkal} калорий.")
-    else: await message.answer(f"За сегодня ты уже съел {max(current_kkal, 0)} калорий, норма перевыполнена на {abs(delta_kkal)} калорий - остановись 📛")
-    if delta_water > 0: await message.answer(f"За сегодня ты уже выпил {max(current_water, 0)} мл, осталось выпить {delta_water} мл.")
-    else: await message.answer(f"За сегодня ты уже выпил {max(current_water, 0)} мл, цель перевыполнена на {abs(delta_water)} мл - ты настоящий Рокки!")
+    activity_loss = users["user_id"]["current_levels"]["activity_loss"]
+    await message.answer(f"Тренировками сегодня ты сжег {activity_loss} калорий.")
+    if delta_kkal > 0: await message.answer(f"За сегодня ты уже получил с учетом расхода {max(current_kkal, 0)} калорий, осталось до цели {delta_kkal} калорий.")
+    else: await message.answer(f"За сегодня ты уже получил с учетом расхода {max(current_kkal, 0)} калорий, норма перевыполнена на {abs(delta_kkal)} калорий - остановись 📛")
+    if delta_water > 0: await message.answer(f"За сегодня с учетом расхода ты восполнил {max(current_water, 0)} мл, осталось выпить {delta_water} мл.")
+    else: await message.answer(f"За сегодня с учетом расхода ты восполнил {max(current_water, 0)} мл, цель перевыполнена на {abs(delta_water)} мл - ты настоящий Рокки!")
+
+
+@router.message(Command("delete_logs"))
+async def delete_logs(message: Message):
+    users['user_id']['current_levels']['kkal_level'] = 0
+    users['user_id']['current_levels']['water_level'] = 0
+    users["user_id"]["current_levels"]["activity_loss"] = 0
+    await message.reply("Все записи очищены. Можете заносить еду, воду и тренировки заново.")
+
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.reply("Могу ответить на команды /start, /set_profile и /help")
+    await message.reply("Могу ответить на команды /start, /set_profile, /log_water, /log_food, /log_workout, /check_progress, /delete_logs и /help")
+
 
 @router.message()
 async def echo_all(message: Message):
